@@ -1,0 +1,1475 @@
+// File: MainActivity.kt
+package com.happygreen.scanner
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import com.happygreen.scanner.data.AppDatabase
+import com.happygreen.scanner.ui.screens.*
+import com.happygreen.scanner.ui.theme.HappyGreenTheme
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // Inizializza database locale
+        AppDatabase.initialize(this)
+        
+        setContent {
+            HappyGreenTheme {
+                HappyGreenApp()
+            }
+        }
+    }
+}
+
+@Composable
+fun HappyGreenApp() {
+    val navController = rememberNavController()
+    
+    NavHost(
+        navController = navController,
+        startDestination = "home"
+    ) {
+        composable("home") { HomeScreen(navController) }
+        composable("scanner") { ScannerScreen(navController) }
+        composable("history") { HistoryScreen(navController) }
+        composable("badges") { BadgesScreen(navController) }
+        composable("profile") { ProfileScreen(navController) }
+    }
+}
+
+// File: ScannerScreen.kt
+package com.happygreen.scanner.ui.screens
+
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.animation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
+import androidx.navigation.NavController
+import com.happygreen.scanner.data.AppDatabase
+import com.happygreen.scanner.data.entities.ScanHistory
+import com.happygreen.scanner.ml.MLKitScanner
+import com.happygreen.scanner.models.*
+import kotlinx.coroutines.launch
+import java.util.*
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ScannerScreen(navController: NavController) {
+    var hasPermission by remember { mutableStateOf(false) }
+    var scannerMode by remember { mutableStateOf(ScannerMode.OBJECT_DETECTION) }
+    var scanResult by remember { mutableStateOf<ScanResult?>(null) }
+    var isScanning by remember { mutableStateOf(false) }
+    var userScore by remember { mutableStateOf(0) }
+    
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    
+    // Carica punteggio utente
+    LaunchedEffect(Unit) {
+        userScore = AppDatabase.getInstance().scanHistoryDao().getTotalScore()
+    }
+    
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasPermission = isGranted
+    }
+    
+    LaunchedEffect(Unit) {
+        hasPermission = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        
+        if (!hasPermission) {
+            launcher.launch(Manifest.permission.CAMERA)
+        }
+    }
+    
+    Column(
+        modifier = Modifier.fillMaxSize()
+    ) {
+        // Top Bar
+        TopAppBar(
+            title = { 
+                Column {
+                    Text("🌱 EcoScanner")
+                    Text(
+                        "Punteggio: $userScore",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            },
+            navigationIcon = {
+                IconButton(onClick = { navController.navigateUp() }) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Indietro")
+                }
+            },
+            actions = {
+                IconButton(onClick = { navController.navigate("history") }) {
+                    Icon(Icons.Default.History, contentDescription = "Cronologia")
+                }
+            }
+        )
+        
+        if (hasPermission) {
+            // Selettore modalità
+            ScannerModeSelector(
+                currentMode = scannerMode,
+                onModeChanged = { 
+                    scannerMode = it
+                    scanResult = null
+                }
+            )
+            
+            // Camera Preview
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                CameraPreview(
+                    scannerMode = scannerMode,
+                    isScanning = isScanning,
+                    onScanStart = { isScanning = true },
+                    onScanResult = { result ->
+                        scanResult = result
+                        isScanning = false
+                        
+                        // Salva nel database
+                        scope.launch {
+                            val scanHistory = ScanHistory(
+                                type = scannerMode.name,
+                                objectName = result.title,
+                                description = result.description,
+                                ecoScore = result.ecoScore,
+                                timestamp = Date()
+                            )
+                            AppDatabase.getInstance().scanHistoryDao().insert(scanHistory)
+                            userScore += result.ecoScore
+                        }
+                    }
+                )
+                
+                // Overlay scanning
+                if (isScanning) {
+                    ScanningOverlay()
+                }
+                
+                // Risultato scan
+                AnimatedVisibility(
+                    visible = scanResult != null,
+                    enter = slideInVertically() + fadeIn(),
+                    exit = slideOutVertically() + fadeOut()
+                ) {
+                    scanResult?.let { result ->
+                        ScanResultCard(
+                            result = result,
+                            onDismiss = { scanResult = null },
+                            onSave = {
+                                // Già salvato automaticamente
+                                scanResult = null
+                            }
+                        )
+                    }
+                }
+                
+                // Pulsante scan manuale
+                FloatingActionButton(
+                    onClick = { 
+                        if (!isScanning) {
+                            isScanning = true
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(32.dp)
+                        .size(80.dp),
+                    containerColor = MaterialTheme.colorScheme.primary
+                ) {
+                    Icon(
+                        Icons.Default.CameraAlt,
+                        contentDescription = "Scansiona",
+                        modifier = Modifier.size(40.dp)
+                    )
+                }
+            }
+        } else {
+            // Richiesta permessi
+            PermissionRequestCard(
+                onRequestPermission = {
+                    launcher.launch(Manifest.permission.CAMERA)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+fun ScannerModeSelector(
+    currentMode: ScannerMode,
+    onModeChanged: (ScannerMode) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly
+    ) {
+        ScannerMode.values().forEach { mode ->
+            FilterChip(
+                onClick = { onModeChanged(mode) },
+                label = { 
+                    Text(
+                        text = mode.displayName,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                },
+                selected = currentMode == mode,
+                leadingIcon = {
+                    Text(mode.emoji)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+fun CameraPreview(
+    scannerMode: ScannerMode,
+    isScanning: Boolean,
+    onScanStart: () -> Unit,
+    onScanResult: (ScanResult) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = context as LifecycleOwner
+    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+    
+    AndroidView(
+        factory = { ctx ->
+            val previewView = PreviewView(ctx)
+            val executor = ContextCompat.getMainExecutor(ctx)
+            
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
+                
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+                
+                val imageAnalyzer = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                    .also {
+                        it.setAnalyzer(
+                            executor, 
+                            MLKitScanner(scannerMode, onScanStart, onScanResult)
+                        )
+                    }
+                
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        preview,
+                        imageAnalyzer
+                    )
+                } catch (exc: Exception) {
+                    // Handle error
+                }
+            }, executor)
+            
+            previewView
+        },
+        modifier = Modifier.fillMaxSize()
+    )
+}
+
+@Composable
+fun ScanningOverlay() {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.padding(32.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    "🔍 Scansionando...",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Text(
+                    "Mantieni l'oggetto nel mirino",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ScanResultCard(
+    result: ScanResult,
+    onDismiss: () -> Unit,
+    onSave: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp)
+        ) {
+            // Header con punteggio
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = result.title,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                EcoScoreChip(result.ecoScore)
+            }
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            Text(
+                text = result.description,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            
+            result.suggestions?.let { suggestions ->
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "💡 Suggerimenti Eco:",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                suggestions.forEach { suggestion ->
+                    Row(
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "• ",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = suggestion,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(20.dp))
+            
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Chiudi")
+                }
+                Button(
+                    onClick = onSave,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        Icons.Default.Save,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Salva")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun EcoScoreChip(score: Int) {
+    val (color, emoji) = when (score) {
+        1 -> MaterialTheme.colorScheme.error to "😟"
+        2 -> MaterialTheme.colorScheme.errorContainer to "😐"
+        3 -> MaterialTheme.colorScheme.primary to "🙂"
+        4 -> Color(0xFF4CAF50) to "😊"
+        5 -> Color(0xFF2E7D32) to "🌟"
+        else -> MaterialTheme.colorScheme.outline to "❓"
+    }
+    
+    AssistChip(
+        onClick = { },
+        label = {
+            Text(
+                "$emoji $score/5",
+                style = MaterialTheme.typography.bodySmall
+            )
+        },
+        colors = AssistChipDefaults.assistChipColors(
+            containerColor = color.copy(alpha = 0.1f),
+            labelColor = color
+        )
+    )
+}
+
+@Composable
+fun PermissionRequestCard(
+    onRequestPermission: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(
+                Icons.Default.CameraAlt,
+                contentDescription = null,
+                modifier = Modifier.size(64.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                "📸 Accesso Fotocamera Richiesto",
+                style = MaterialTheme.typography.headlineSmall
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "Per scansionare oggetti e aiutarti a essere più eco-friendly, abbiamo bisogno di accedere alla fotocamera.",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Button(
+                onClick = onRequestPermission,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Consenti Accesso Fotocamera")
+            }
+        }
+    }
+}
+
+// File: MLKitScanner.kt
+package com.happygreen.scanner.ml
+
+import android.util.Log
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.label.ImageLabeling
+import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+import com.happygreen.scanner.data.EcoDatabase
+import com.happygreen.scanner.models.*
+
+class MLKitScanner(
+    private val scannerMode: ScannerMode,
+    private val onScanStart: () -> Unit,
+    private val onScanResult: (ScanResult) -> Unit
+) : ImageAnalysis.Analyzer {
+    
+    private var lastScanTime = 0L
+    private val scanInterval = 3000L // 3 secondi tra scan
+    private var isProcessing = false
+    
+    @androidx.camera.core.ExperimentalGetImage
+    override fun analyze(imageProxy: ImageProxy) {
+        val currentTime = System.currentTimeMillis()
+        
+        if (isProcessing || currentTime - lastScanTime < scanInterval) {
+            imageProxy.close()
+            return
+        }
+        
+        val mediaImage = imageProxy.image
+        if (mediaImage != null) {
+            isProcessing = true
+            onScanStart()
+            
+            val image = InputImage.fromMediaImage(
+                mediaImage, 
+                imageProxy.imageInfo.rotationDegrees
+            )
+            
+            when (scannerMode) {
+                ScannerMode.OBJECT_DETECTION -> analyzeForObjects(image)
+                ScannerMode.BARCODE_SCANNER -> analyzeForBarcodes(image)
+                ScannerMode.WASTE_CLASSIFICATION -> analyzeForWaste(image)
+            }
+            
+            lastScanTime = currentTime
+        }
+        imageProxy.close()
+    }
+    
+    private fun analyzeForObjects(image: InputImage) {
+        val labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS)
+        
+        labeler.process(image)
+            .addOnSuccessListener { labels ->
+                val bestLabel = labels
+                    .filter { it.confidence > 0.7f }
+                    .maxByOrNull { it.confidence }
+                
+                bestLabel?.let { label ->
+                    val result = EcoDatabase.getObjectInfo(label.text, label.confidence)
+                    onScanResult(result)
+                }
+                isProcessing = false
+            }
+            .addOnFailureListener { e ->
+                Log.e("MLKitScanner", "Object detection failed", e)
+                isProcessing = false
+            }
+    }
+    
+    private fun analyzeForBarcodes(image: InputImage) {
+        val scanner = BarcodeScanning.getClient()
+        
+        scanner.process(image)
+            .addOnSuccessListener { barcodes ->
+                barcodes.firstOrNull()?.rawValue?.let { barcode ->
+                    val result = EcoDatabase.getProductInfo(barcode)
+                    onScanResult(result)
+                }
+                isProcessing = false
+            }
+            .addOnFailureListener { e ->
+                Log.e("MLKitScanner", "Barcode scanning failed", e)
+                isProcessing = false
+            }
+    }
+    
+    private fun analyzeForWaste(image: InputImage) {
+        val labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS)
+        
+        labeler.process(image)
+            .addOnSuccessListener { labels ->
+                val wasteLabel = labels
+                    .filter { it.confidence > 0.6f }
+                    .firstOrNull { label ->
+                        EcoDatabase.classifyWaste(label.text) != null
+                    }
+                
+                wasteLabel?.let { label ->
+                    val wasteType = EcoDatabase.classifyWaste(label.text)
+                    wasteType?.let { type ->
+                        val result = EcoDatabase.getWasteInfo(type, label.text)
+                        onScanResult(result)
+                    }
+                }
+                isProcessing = false
+            }
+            .addOnFailureListener { e ->
+                Log.e("MLKitScanner", "Waste classification failed", e)
+                isProcessing = false
+            }
+    }
+}
+
+// File: EcoDatabase.kt
+package com.happygreen.scanner.data
+
+import com.happygreen.scanner.models.*
+import kotlin.random.Random
+
+object EcoDatabase {
+    
+    private val objectDatabase = mapOf(
+        // Bottiglie e Contenitori
+        listOf("bottle", "plastic bottle", "water bottle") to ObjectInfo(
+            title = "🍼 Bottiglia di Plastica",
+            description = "Questa bottiglia può impiegare fino a 500 anni per decomporsi! Ogni anno, 8 milioni di tonnellate di plastica finiscono negli oceani.",
+            suggestions = listOf(
+                "Riutilizzala come vaso per piante o contenitore",
+                "Riciclala nel contenitore della plastica",
+                "Scegli bottiglie riutilizzabili in acciaio o vetro",
+                "Una bottiglia riutilizzabile può sostituire 1.000 bottiglie monouso"
+            ),
+            ecoScore = 2,
+            facts = listOf(
+                "Le bottiglie di plastica impiegano 450 anni per decomporsi",
+                "Solo il 23% delle bottiglie viene riciclato in Italia"
+            )
+        ),
+        
+        listOf("glass bottle", "wine bottle", "jar") to ObjectInfo(
+            title = "🫙 Bottiglia di Vetro",
+            description = "Il vetro è fantastico! È riciclabile al 100% infinite volte senza perdere qualità.",
+            suggestions = listOf(
+                "Riutilizzala come vaso o contenitore",
+                "Il vetro riciclato usa il 40% meno energia",
+                "Rimuovi tappi e etichette prima del riciclo"
+            ),
+            ecoScore = 5,
+            facts = listOf("Una bottiglia di vetro può essere riciclata infinite volte")
+        ),
+        
+        // Lattine
+        listOf("can", "aluminum can", "soda can") to ObjectInfo(
+            title = "🥤 Lattina di Alluminio",
+            description = "Le lattine sono campioni del riciclo! Una lattina può diventare una nuova lattina in sole 6 settimane.",
+            suggestions = listOf(
+                "Ricicla sempre le lattine - sono molto preziose",
+                "L'alluminio riciclato usa il 95% meno energia",
+                "Schiaccia la lattina per risparmiare spazio",
+                "Una lattina riciclata alimenta una TV per 3 ore"
+            ),
+            ecoScore = 5,
+            facts = listOf("Riciclare una lattina risparmia energia per 20 ore di TV")
+        ),
+        
+        // Piante
+        listOf("plant", "flower", "leaf", "tree") to ObjectInfo(
+            title = "🌱 Pianta",
+            description = "Le piante sono i nostri supereroi verdi! Producono ossigeno, assorbono CO2 e rendono l'aria più pulita.",
+            suggestions = listOf(
+                "Prenditi cura delle piante intorno a te",
+                "Pianta nuovi alberi quando possibile",
+                "Le piante da interno migliorano la qualità dell'aria",
+                "Rispetta la natura durante le passeggiate"
+            ),
+            ecoScore = 5,
+            facts = listOf(
+                "Un albero produce ossigeno per 2 persone al giorno",
+                "Le piante assorbono 22 kg di CO2 all'anno"
+            )
+        ),
+        
+        // Plastica generica
+        listOf("plastic", "plastic bag", "container") to ObjectInfo(
+            title = "♻️ Oggetto di Plastica",
+            description = "La plastica è ovunque, ma possiamo usarla meglio! Ricorda: Riduci, Riutilizza, Ricicla.",
+            suggestions = listOf(
+                "Controlla il numero sul fondo per il riciclo corretto",
+                "Pulisci prima di riciclare",
+                "Preferisci alternative riutilizzabili",
+                "Evita la plastica monouso quando possibile"
+            ),
+            ecoScore = 3,
+            facts = listOf("Esistono 7 tipi di plastica, ognuno riciclabile diversamente")
+        ),
+        
+        // Carta
+        listOf("paper", "cardboard", "newspaper", "book") to ObjectInfo(
+            title = "📄 Carta",
+            description = "La carta è fatta dagli alberi, ma può avere una seconda vita attraverso il riciclo!",
+            suggestions = listOf(
+                "Usa entrambi i lati dei fogli",
+                "Ricicla carta e cartone separatamente",
+                "Evita carta unta o sporca nel riciclo",
+                "5 fogli riciclati = 1 foglio nuovo"
+            ),
+            ecoScore = 4,
+            facts = listOf("Riciclare una tonnellata di carta salva 17 alberi")
+        )
+    )
+    
+    private val wasteClassification = mapOf(
+        WasteType.PLASTIC to WasteInfo(
+            title = "♻️ Plastica",
+            description = "La plastica va nel contenitore giallo (o secondo il tuo comune). Controlla sempre il simbolo di riciclo!",
+            binColor = "🟡 Giallo",
+            suggestions = listOf(
+                "Pulisci i contenitori prima di buttarli",
+                "Rimuovi tappi se diversi dal contenitore",
+                "Non tutti i tipi di plastica sono riciclabili",
+                "Controlla il numero nel triangolo (1-7)"
+            ),
+            ecoScore = 3,
+            decompositionTime = "20-500 anni"
+        ),
+        
+        WasteType.PAPER to WasteInfo(
+            title = "📄 Carta e Cartone",
+            description = "Carta e cartone vanno nel contenitore blu. Sono materiali preziosi per il riciclo!",
+            binColor = "🔵 Blu",
+            suggestions = listOf(
+                "Rimuovi nastri adesivi e punti metallici",
+                "Non buttare carta unta o molto sporca",
+                "Appiattisci le scatole per risparmiare spazio",
+                "La carta può essere riciclata 6-7 volte"
+            ),
+            ecoScore = 4,
+            decompositionTime = "2-6 mesi"
+        ),
+        
+        WasteType.GLASS to WasteInfo(
+            title = "🫙 Vetro",
+            description = "Il vetro va nel contenitore verde. È il materiale più eco-friendly che esista!",
+            binColor = "🟢 Verde",
+            suggestions = listOf(
+                "Rimuovi tappi e coperchi metallici",
+                "Il vetro colorato e trasparente vanno insieme",
+                "Non rompere i contenitori di vetro",
+                "Il vetro si ricicla al 100% infinite volte"
+            ),
+            ecoScore = 5,
+            decompositionTime = "4000+ anni (ma riciclabile al 100%)"
+        ),
+        
+        WasteType.METAL to WasteInfo(
+            title = "🔩 Metalli",
+            description = "I metalli sono super preziosi! Vanno spesso con la plastica o in contenitori appositi.",
+            binColor = "🟡 Con plastica",
+            suggestions = listOf(
+                "Separa i diversi tipi di metallo se richiesto",
+                "Pulisci lattine e contenitori",
+                "I metalli si riciclano infinite volte",
+                "L'alluminio riciclato usa il 95% meno energia"
+            ),
+            ecoScore = 5,
+            decompositionTime = "50-200 anni"
+        ),
+        
+        WasteType.ORGANIC to WasteInfo(
+            title = "🍎 Rifiuti Organici",
+            description = "I rifiuti organici diventano compost! Vanno nel contenitore marrone dell'umido.",
+            binColor = "🤎 Marrone",
+            suggestions = listOf(
+                "Usa sacchetti biodegradabili",
+                "Considera il compostaggio domestico",
+                "Non mescolare con altri materiali",
+                "Il compost è oro per le piante!"
+            ),
+            ecoScore = 4,
+            decompositionTime = "2 settimane - 2 anni"
+        )
+    )
+    
+    private val productDatabase = mapOf(
+        // Esempi di codici a barre comuni
+        "8001505005707" to ProductInfo(
+            name = "Acqua Minerale",
+            brand = "Esempio Brand",
+            ecoScore = 3,
+            sustainability = "Bottiglia di plastica riciclabile",
+            alternatives = listOf(
+                "Acqua del rubinetto con filtro",
+                "Bottiglia riutilizzabile",
+                "Borraccia in acciaio"
+            ),
+            certifications = listOf("Plastica riciclabile")
+        )
+    )
+    
+    fun getObjectInfo(objectName: String, confidence: Float): ScanResult {
+        val normalizedName = objectName.lowercase()
+        
+        val matchingEntry = objectDatabase.entries.find { (keys, _) ->
+            keys.any { key -> normalizedName.contains(key) }
+        }
+        
+        return matchingEntry?.let { (_, info) ->
+            ScanResult(
+                title = info.title,
+                description = info.description,
+                suggestions = info.suggestions,
+                ecoScore = info.ecoScore,
+                additionalInfo = info.facts?.random(),
+                confidence = confidence
+            )
+        } ?: generateGenericObjectInfo(objectName, confidence)
+    }
+    
+    private fun generateGenericObjectInfo(objectName: String, confidence: Float): ScanResult {
+        val tips = listOf(
+            "Pensa sempre: posso riutilizzare questo oggetto?",
+            "Controlla se è riciclabile nella tua zona",
+            "Cerca alternative più sostenibili",
+            "Condividi con amici per ridurre gli sprechi"
+        )
+        
+        return ScanResult(
+            title = "🔍 ${objectName.capitalize()}",
+            description = "Hai trovato un oggetto interessante! Confidence: ${(confidence * 100).toInt()}%",
+            suggestions = tips.shuffled().take(2),
+            ecoScore = Random.nextInt(2, 4),
+            confidence = confidence
+        )
+    }
+    
+    fun getProductInfo(barcode: String): ScanResult {
+        val product = productDatabase[barcode]
+        
+        return if (product != null) {
+            ScanResult(
+                title = "📦 ${product.name}",
+                description = "Brand: ${product.brand}\n${product.sustainability}",
+                suggestions = product.alternatives,
+                ecoScore = product.ecoScore
+            )
+        } else {
+            // Genera informazioni casuali per dimostrazione
+            val randomTips = listOf(
+                "Controlla l'etichetta per certificazioni ambientali",
+                "Cerca il simbolo di riciclaggio",
+                "Preferisci prodotti con meno imballaggio",
+                "Scegli marchi con politiche sostenibili"
+            )
+            
+            ScanResult(
+                title = "📱 Prodotto Scansionato",
+                description = "Codice: $barcode\nAnalizzando la sostenibilità di questo prodotto...",
+                suggestions = randomTips.shuffled().take(3),
+                ecoScore = Random.nextInt(2, 5)
+            )
+        }
+    }
+    
+    fun classifyWaste(objectName: String): WasteType? {
+        val name = objectName.lowercase()
+        return when {
+            name.contains("bottle") && name.contains("plastic") -> WasteType.PLASTIC
+            name.contains("plastic") || name.contains("bag") || name.contains("container") -> WasteType.PLASTIC
+            name.contains("paper") || name.contains("cardboard") || name.contains("newspaper") -> WasteType.PAPER
+            name.contains("glass") || name.contains("jar") || name.contains("wine") -> WasteType.GLASS
+            name.contains("can") || name.contains("aluminum") || name.contains("metal") -> WasteType.METAL
+            name.contains("apple") || name.contains("banana") || name.contains("food") || name.contains("organic") -> WasteType.ORGANIC
+            else -> null
+        }
+    }
+    
+    fun getWasteInfo(wasteType: WasteType, objectName: String): ScanResult {
+        val wasteInfo = wasteClassification[wasteType]!!
+        
+        return ScanResult(
+            title = wasteInfo.title,
+            description = "${wasteInfo.description}\n\n🗑️ Contenitore: ${wasteInfo.binColor}\n⏱️ Decomposizione: ${wasteInfo.decompositionTime}",
+            suggestions = wasteInfo.suggestions,
+            ecoScore = wasteInfo.ecoScore
+        )
+    }
+}
+
+// File: Models.kt
+package com.happygreen.scanner.models
+
+data class ScanResult(
+    val title: String,
+    val description: String,
+    val suggestions: List<String>? = null,
+    val ecoScore: Int = 3,
+    val additionalInfo: String? = null,
+    val confidence: Float? = null
+)
+
+enum class ScannerMode(val displayName: String, val emoji: String) {
+    OBJECT_DETECTION("Oggetti", "🔍"),
+    BARCODE_SCANNER("Codici", "📱"), 
+    WASTE_CLASSIFICATION("Rifiuti", "♻️")
+}
+
+enum class WasteType {
+    PLASTIC, PAPER, GLASS, METAL, ORGANIC
+}
+
+data class ObjectInfo(
+    val title: String,
+    val description: String,
+    val suggestions: List<String>,
+    val ecoScore: Int,
+    val facts: List<String>? = null
+)
+
+data class WasteInfo(
+    val title: String,
+    val description: String,
+    val binColor: String,
+    val suggestions: List<String>,
+    val ecoScore: Int,
+    val decompositionTime: String
+)
+
+data class ProductInfo(
+    val name: String,
+    val brand: String,
+    val ecoScore: Int,
+    val sustainability: String,
+    val alternatives: List<String>,
+    val certifications: List<String>
+)
+
+// File: Database Entities
+package com.happygreen.scanner.data.entities
+
+import androidx.room.*
+import java.util.*
+
+@Entity(tableName = "scan_history")
+data class ScanHistory(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val type: String,
+    val objectName: String,
+    val description: String,
+    val ecoScore: Int,
+    val timestamp: Date
+)
+
+@Entity(tableName = "user_badges")
+data class UserBadge(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val badgeName: String,
+    val description: String,
+    val iconEmoji: String,
+    val earnedDate: Date,
+    val isUnlocked: Boolean = true
+)
+
+@Entity(tableName = "user_profile")
+data class UserProfile(
+    @PrimaryKey val id: String = "main_profile",
+    val totalScore: Int,
+    val totalScans: Int,
+    val level: Int,
+    val username: String,
+    val joinDate: Date
+)
+
+// File: DAOs
+package com.happygreen.scanner.data.dao
+
+import androidx.room.*
+import com.happygreen.scanner.data.entities.*
+import kotlinx.coroutines.flow.Flow
+import java.util.*
+
+@Dao
+interface ScanHistoryDao {
+    @Query("SELECT * FROM scan_history ORDER BY timestamp DESC")
+    fun getAllScans(): Flow<List<ScanHistory>>
+    
+    @Query("SELECT * FROM scan_history ORDER BY timestamp DESC LIMIT 10")
+    fun getRecentScans(): Flow<List<ScanHistory>>
+    
+    @Query("SELECT SUM(ecoScore) FROM scan_history")
+    suspend fun getTotalScore(): Int
+    
+    @Query("SELECT COUNT(*) FROM scan_history")
+    suspend fun getTotalScans(): Int
+    
+    @Query("SELECT COUNT(*) FROM scan_history WHERE type = :type")
+    suspend fun getScansOfType(type: String): Int
+    
+    @Insert
+    suspend fun insert(scanHistory: ScanHistory)
+    
+    @Delete
+    suspend fun delete(scanHistory: ScanHistory)
+    
+    @Query("DELETE FROM scan_history")
+    suspend fun deleteAll()
+}
+
+@Dao
+interface UserBadgeDao {
+    @Query("SELECT * FROM user_badges WHERE isUnlocked = 1 ORDER BY earnedDate DESC")
+    fun getUnlockedBadges(): Flow<List<UserBadge>>
+    
+    @Query("SELECT * FROM user_badges ORDER BY earnedDate DESC")
+    fun getAllBadges(): Flow<List<UserBadge>>
+    
+    @Insert
+    suspend fun insert(badge: UserBadge)
+    
+    @Update
+    suspend fun update(badge: UserBadge)
+}
+
+@Dao
+interface UserProfileDao {
+    @Query("SELECT * FROM user_profile WHERE id = 'main_profile'")
+    suspend fun getProfile(): UserProfile?
+    
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdate(profile: UserProfile)
+}
+
+// File: Database
+package com.happygreen.scanner.data
+
+import android.content.Context
+import androidx.room.*
+import com.happygreen.scanner.data.dao.*
+import com.happygreen.scanner.data.entities.*
+import java.util.*
+
+@TypeConverters(Converters::class)
+@Database(
+    entities = [ScanHistory::class, UserBadge::class, UserProfile::class],
+    version = 1,
+    exportSchema = false
+)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun scanHistoryDao(): ScanHistoryDao
+    abstract fun userBadgeDao(): UserBadgeDao
+    abstract fun userProfileDao(): UserProfileDao
+    
+    companion object {
+        @Volatile
+        private var INSTANCE: AppDatabase? = null
+        
+        fun getInstance(): AppDatabase {
+            return INSTANCE ?: throw IllegalStateException("Database not initialized")
+        }
+        
+        fun initialize(context: Context) {
+            if (INSTANCE == null) {
+                synchronized(this) {
+                    INSTANCE = Room.databaseBuilder(
+                        context.applicationContext,
+                        AppDatabase::class.java,
+                        "happygreen_database"
+                    ).build()
+                }
+            }
+        }
+    }
+}
+
+class Converters {
+    @TypeConverter
+    fun fromTimestamp(value: Long?): Date? {
+        return value?.let { Date(it) }
+    }
+    
+    @TypeConverter
+    fun dateToTimestamp(date: Date?): Long? {
+        return date?.time
+    }
+}
+
+// File: HomeScreen.kt
+package com.happygreen.scanner.ui.screens
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.navigation.NavController
+import com.happygreen.scanner.data.AppDatabase
+import com.happygreen.scanner.data.entities.ScanHistory
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HomeScreen(navController: NavController) {
+    var totalScore by remember { mutableStateOf(0) }
+    var totalScans by remember { mutableStateOf(0) }
+    var recentScans by remember { mutableStateOf<List<ScanHistory>>(emptyList()) }
+    
+    val scope = rememberCoroutineScope()
+    
+    LaunchedEffect(Unit) {
+        scope.launch {
+            val dao = AppDatabase.getInstance().scanHistoryDao()
+            totalScore = dao.getTotalScore()
+            totalScans = dao.getTotalScans()
+        }
+    }
+    
+    LaunchedEffect(Unit) {
+        AppDatabase.getInstance().scanHistoryDao().getRecentScans().collect {
+            recentScans = it
+        }
+    }
+    
+    Column(
+        modifier = Modifier.fillMaxSize()
+    ) {
+        TopAppBar(
+            title = { Text("🌱 HappyGreen") },
+            actions = {
+                IconButton(onClick = { navController.navigate("profile") }) {
+                    Icon(Icons.Default.Person, contentDescription = "Profilo")
+                }
+            }
+        )
+        
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Welcome Card
+            item {
+                WelcomeCard(
+                    totalScore = totalScore,
+                    totalScans = totalScans,
+                    onScanClick = { navController.navigate("scanner") }
+                )
+            }
+            
+            // Quick Actions
+            item {
+                QuickActionsCard(navController)
+            }
+            
+            // Recent Scans
+            item {
+                Text(
+                    "📊 Scansioni Recenti",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            
+            if (recentScans.isEmpty()) {
+                item {
+                    EmptyStateCard(
+                        title = "Inizia a Scansionare!",
+                        description = "Usa la fotocamera per scoprire come essere più eco-friendly",
+                        onActionClick = { navController.navigate("scanner") }
+                    )
+                }
+            } else {
+                items(recentScans) { scan ->
+                    ScanHistoryItem(scan)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun WelcomeCard(
+    totalScore: Int,
+    totalScans: Int,
+    onScanClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp)
+        ) {
+            Text(
+                "Benvenuto, Eco-Warrior! 🌍",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceAround
+            ) {
+                StatsItem("🏆 Punteggio", totalScore.toString())
+                StatsItem("📱 Scansioni", totalScans.toString())
+                StatsItem("🌱 Livello", ((totalScore / 50) + 1).toString())
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Button(
+                onClick = onScanClick,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.CameraAlt, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Inizia a Scansionare")
+            }
+        }
+    }
+}
+
+@Composable
+fun StatsItem(label: String, value: String) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            value,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
+
+@Composable
+fun QuickActionsCard(navController: NavController) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                "🚀 Azioni Rapide",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Medium
+            )
+            
+            Spacer(modifier = Modifier.height(12.dp))
+            
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                QuickActionButton(
+                    icon = Icons.Default.History,
+                    label = "Cronologia",
+                    onClick = { navController.navigate("history") },
+                    modifier = Modifier.weight(1f)
+                )
+                QuickActionButton(
+                    icon = Icons.Default.EmojiEvents,
+                    label = "Badge",
+                    onClick = { navController.navigate("badges") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun QuickActionButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = modifier
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(icon, contentDescription = null)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(label, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+fun ScanHistoryItem(scan: ScanHistory) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val emoji = when (scan.type) {
+                "OBJECT_DETECTION" -> "🔍"
+                "BARCODE_SCANNER" -> "📱"
+                "WASTE_CLASSIFICATION" -> "♻️"
+                else -> "🔍"
+            }
+            
+            Text(
+                emoji,
+                style = MaterialTheme.typography.headlineMedium
+            )
+            
+            Spacer(modifier = Modifier.width(16.dp))
+            
+            Column(
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    scan.objectName,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    scan.description.take(50) + if (scan.description.length > 50) "..." else "",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            
+            Column(
+                horizontalAlignment = Alignment.End
+            ) {
+                Text(
+                    "+${scan.ecoScore}",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun EmptyStateCard(
+    title: String,
+    description: String,
+    onActionClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                "🌱",
+                style = MaterialTheme.typography.displayMedium
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                title,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                description,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(onClick = onActionClick) {
+                Text("Inizia Ora")
+            }
+        }
+    }
+}
+
+// File: build.gradle (Module: app)
+/*
+android {
+    compileSdk 34
+    
+    defaultConfig {
+        applicationId "com.happygreen.scanner"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+    
+    buildFeatures {
+        compose true
+    }
+    
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.4'
+    }
+}
+
+dependencies {
+    // Compose BOM
+    implementation platform('androidx.compose:compose-bom:2023.10.01')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    
+    // Activity Compose
+    implementation 'androidx.activity:activity-compose:1.8.1'
+    
+    // Navigation
+    implementation 'androidx.navigation:navigation-compose:2.7.5'
+    
+    // Camera
+    implementation 'androidx.camera:camera-core:1.3.0'
+    implementation 'androidx.camera:camera-camera2:1.3.0'
+    implementation 'androidx.camera:camera-lifecycle:1.3.0'
+    implementation 'androidx.camera:camera-view:1.3.0'
+    
+    // ML Kit
+    implementation 'com.google.mlkit:image-labeling:17.0.7'
+    implementation 'com.google.mlkit:barcode-scanning:17.2.0'
+    
+    // Room Database
+    implementation 'androidx.room:room-runtime:2.6.0'
+    implementation 'androidx.room:room-ktx:2.6.0'
+    kapt 'androidx.room:room-compiler:2.6.0'
+    
+    // Lifecycle
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0'
+    
+    // Coroutines
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}
+*/
